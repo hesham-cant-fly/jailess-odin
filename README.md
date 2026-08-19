@@ -19,8 +19,7 @@
     </a>
 </p>
 
-# The Odin Programming Language
-
+# The Odin Programming Language (Now With Less Jai)
 
 Odin is a general-purpose programming language with distinct typing, built for high performance, modern systems, and built-in data-oriented data types. The Odin Programming Language, the C alternative for the joy of programming.
 
@@ -31,9 +30,9 @@ package main
 
 import "core:fmt"
 
-main :: proc() {
-	program := "+ + * 😃 - /"
-	accumulator := 0
+const main = proc() {
+	var program = "+ + * 😃 - /"
+	accumulator := 0 // This fork is backward compatible with the upstream :D
 
 	for token in program {
 		switch token {
