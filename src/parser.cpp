@@ -1460,8 +1460,13 @@ gb_internal Ast *ast_label_decl(AstFile *f, Token token, Ast *name) {
 	return result;
 }
 
-gb_internal Ast *ast_value_decl(AstFile *f, Array<Ast *> const &names, Ast *type, Array<Ast *> const &values, bool is_mutable,
-                    CommentGroup *docs, CommentGroup *comment) {
+gb_internal Ast *ast_value_decl(AstFile *f,
+								Array<Ast *> const &names,
+								Ast *type,
+								Array<Ast *> const &values,
+								bool is_mutable,
+								CommentGroup *docs,
+								CommentGroup *comment) {
 	Ast *result = alloc_ast_node(f, Ast_ValueDecl);
 	result->ValueDecl.names      = slice_from_array(names);
 	result->ValueDecl.type       = type;
@@ -2793,6 +2798,124 @@ gb_internal Ast *parse_asm_template(AstFile *f) {
 	return asm_template;
 }
 
+gb_internal Ast *parse_proc(AstFile *f) 
+{
+	Token token = f->prev_token;
+	if (f->curr_token.kind == Token_OpenBrace) { // ProcGroup
+		Token open = expect_token(f, Token_OpenBrace);
+
+		auto args = array_make<Ast *>(ast_allocator(f));
+
+		while (f->curr_token.kind != Token_CloseBrace &&
+			   f->curr_token.kind != Token_EOF) {
+			Ast *elem = parse_expr(f, false);
+
+			if (f->curr_token.kind == Token_where) {
+				Token where = expect_token(f, Token_where);
+				Ast *cond = parse_expr(f, false);
+				elem = ast_binary_expr(f, where, elem, cond);
+			}
+
+			array_add(&args, elem);
+			if (!allow_field_separator(f)) {
+				break;
+			}
+		}
+
+		Token close = expect_token(f, Token_CloseBrace);
+
+		if (args.count == 0) {
+			syntax_error(token, "Expected a least 1 argument in a procedure group");
+		}
+
+		return ast_proc_group(f, token, open, close, args);
+	}
+
+
+	Ast *type = parse_proc_type(f, token);
+	Token where_token = {};
+	Array<Ast *> where_clauses = {};
+	u64 tags = 0;
+
+	skip_possible_newline_for_literal(f);
+
+
+	if (f->curr_token.kind == Token_where) {
+		where_token = expect_token(f, Token_where);
+		isize prev_level = f->expr_level;
+		f->expr_level = -1;
+		where_clauses = parse_rhs_expr_list(f);
+		f->expr_level = prev_level;
+	}
+
+	parse_proc_tags(f, &tags);
+	if ((tags & ProcTag_require_results) != 0) {
+		syntax_error(f->curr_token, "#require_results has now been replaced as an attribute @(require_results) on the declaration");
+		tags &= ~ProcTag_require_results;
+	}
+	GB_ASSERT(type->kind == Ast_ProcType);
+	type->ProcType.tags = tags;
+
+	if (f->allow_type && f->expr_level < 0) {
+		if (tags != 0) {
+			syntax_error(token, "A procedure type cannot have suffix tags");
+		}
+		if (where_token.kind != Token_Invalid) {
+			syntax_error(where_token, "'where' clauses are not allowed on procedure types");
+		}
+		return type;
+	}
+
+	skip_possible_newline_for_literal(f, where_token.kind == Token_where);
+
+	if (allow_token(f, Token_Uninit)) {
+		if (where_token.kind != Token_Invalid) {
+			syntax_error(where_token, "'where' clauses are not allowed on procedure literals without a defined body (replaced with ---)");
+		}
+		return ast_proc_lit(f, type, nullptr, tags, where_token, where_clauses);
+	} else if (f->curr_token.kind == Token_OpenBrace) {
+		Ast *curr_proc = f->curr_proc;
+		Ast *body = nullptr;
+		f->curr_proc = type;
+		body = parse_body(f);
+		f->curr_proc = curr_proc;
+
+		// Apply the tags directly to the body rather than the type
+		if (tags & ProcTag_no_bounds_check) {
+			body->state_flags |= StateFlag_no_bounds_check;
+		}
+		if (tags & ProcTag_bounds_check) {
+			body->state_flags |= StateFlag_bounds_check;
+		}
+		if (tags & ProcTag_no_type_assert) {
+			body->state_flags |= StateFlag_no_type_assert;
+		}
+		if (tags & ProcTag_type_assert) {
+			body->state_flags |= StateFlag_type_assert;
+		}
+
+		return ast_proc_lit(f, type, body, tags, where_token, where_clauses);
+	} else if (allow_token(f, Token_do)) {
+		Ast *curr_proc = f->curr_proc;
+		Ast *body = nullptr;
+		f->curr_proc = type;
+		body = convert_stmt_to_body(f, parse_stmt(f));
+		f->curr_proc = curr_proc;
+
+		syntax_error(body, "'do' for procedure bodies is not allowed, prefer {}");
+
+		return ast_proc_lit(f, type, body, tags, where_token, where_clauses);
+	}
+
+	if (tags != 0) {
+		syntax_error(token, "A procedure type cannot have suffix tags");
+	}
+	if (where_token.kind != Token_Invalid) {
+		syntax_error(where_token, "'where' clauses are not allowed on procedure types");
+	}
+
+	return type;
+}
 
 gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 	Ast *operand = nullptr; // Operand
@@ -2957,125 +3080,11 @@ gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 	}
 
 	// Parse Procedure Type or Literal or Group
+
 	case Token_proc: {
-		Token token = expect_token(f, Token_proc);
-
-		if (f->curr_token.kind == Token_OpenBrace) { // ProcGroup
-			Token open = expect_token(f, Token_OpenBrace);
-
-			auto args = array_make<Ast *>(ast_allocator(f));
-
-			while (f->curr_token.kind != Token_CloseBrace &&
-			       f->curr_token.kind != Token_EOF) {
-				Ast *elem = parse_expr(f, false);
-
-				if (f->curr_token.kind == Token_where) {
-					Token where = expect_token(f, Token_where);
-					Ast *cond = parse_expr(f, false);
-					elem = ast_binary_expr(f, where, elem, cond);
-				}
-
-				array_add(&args, elem);
-				if (!allow_field_separator(f)) {
-					break;
-				}
-			}
-
-			Token close = expect_token(f, Token_CloseBrace);
-
-			if (args.count == 0) {
-				syntax_error(token, "Expected a least 1 argument in a procedure group");
-			}
-
-			return ast_proc_group(f, token, open, close, args);
-		}
-
-
-		Ast *type = parse_proc_type(f, token);
-		Token where_token = {};
-		Array<Ast *> where_clauses = {};
-		u64 tags = 0;
-
-		skip_possible_newline_for_literal(f);
-
-
-		if (f->curr_token.kind == Token_where) {
-			where_token = expect_token(f, Token_where);
-			isize prev_level = f->expr_level;
-			f->expr_level = -1;
-			where_clauses = parse_rhs_expr_list(f);
-			f->expr_level = prev_level;
-		}
-
-		parse_proc_tags(f, &tags);
-		if ((tags & ProcTag_require_results) != 0) {
-			syntax_error(f->curr_token, "#require_results has now been replaced as an attribute @(require_results) on the declaration");
-			tags &= ~ProcTag_require_results;
-		}
-		GB_ASSERT(type->kind == Ast_ProcType);
-		type->ProcType.tags = tags;
-
-		if (f->allow_type && f->expr_level < 0) {
-			if (tags != 0) {
-				syntax_error(token, "A procedure type cannot have suffix tags");
-			}
-			if (where_token.kind != Token_Invalid) {
-				syntax_error(where_token, "'where' clauses are not allowed on procedure types");
-			}
-			return type;
-		}
-
-		skip_possible_newline_for_literal(f, where_token.kind == Token_where);
-
-		if (allow_token(f, Token_Uninit)) {
-			if (where_token.kind != Token_Invalid) {
-				syntax_error(where_token, "'where' clauses are not allowed on procedure literals without a defined body (replaced with ---)");
-			}
-			return ast_proc_lit(f, type, nullptr, tags, where_token, where_clauses);
-		} else if (f->curr_token.kind == Token_OpenBrace) {
-			Ast *curr_proc = f->curr_proc;
-			Ast *body = nullptr;
-			f->curr_proc = type;
-			body = parse_body(f);
-			f->curr_proc = curr_proc;
-
-			// Apply the tags directly to the body rather than the type
-			if (tags & ProcTag_no_bounds_check) {
-				body->state_flags |= StateFlag_no_bounds_check;
-			}
-			if (tags & ProcTag_bounds_check) {
-				body->state_flags |= StateFlag_bounds_check;
-			}
-			if (tags & ProcTag_no_type_assert) {
-				body->state_flags |= StateFlag_no_type_assert;
-			}
-			if (tags & ProcTag_type_assert) {
-				body->state_flags |= StateFlag_type_assert;
-			}
-
-			return ast_proc_lit(f, type, body, tags, where_token, where_clauses);
-		} else if (allow_token(f, Token_do)) {
-			Ast *curr_proc = f->curr_proc;
-			Ast *body = nullptr;
-			f->curr_proc = type;
-			body = convert_stmt_to_body(f, parse_stmt(f));
-			f->curr_proc = curr_proc;
-
-			syntax_error(body, "'do' for procedure bodies is not allowed, prefer {}");
-
-			return ast_proc_lit(f, type, body, tags, where_token, where_clauses);
-		}
-
-		if (tags != 0) {
-			syntax_error(token, "A procedure type cannot have suffix tags");
-		}
-		if (where_token.kind != Token_Invalid) {
-			syntax_error(where_token, "'where' clauses are not allowed on procedure types");
-		}
-
-		return type;
+		expect_token(f, Token_proc);
+		return parse_proc(f);
 	}
-
 
 	// Check for Types
 	case Token_Dollar: {
@@ -3968,6 +3977,11 @@ gb_internal Ast *parse_binary_expr(AstFile *f, bool lhs, i32 prec_in) {
 	Ast *expr = parse_unary_expr(f, lhs);
 	for (;;) {
 		Token op = f->curr_token;
+
+		if (op.kind == Token_Semicolon && op.string == "\n" && peek_token(f).kind == Token_Pipe) {
+			advance_token(f);
+			op = f->curr_token;
+		}
 		i32 op_prec = token_precedence(f, op.kind);
 		if (op_prec < prec_in) {
 			// NOTE(bill): This will also catch operators that are not valid "binary" operators
@@ -4235,7 +4249,12 @@ gb_internal Ast *parse_value_decl(AstFile *f, Array<Ast *> names, CommentGroup *
 		}
 	}
 
-	return ast_value_decl(f, names, type, values, is_mutable, docs, end_comment);
+	return ast_value_decl(f,
+						  names,
+						  type,
+						  values,
+						  is_mutable,
+						  docs, end_comment);
 }
 
 gb_internal Ast *parse_simple_stmt(AstFile *f, u32 flags) {
@@ -4244,24 +4263,34 @@ gb_internal Ast *parse_simple_stmt(AstFile *f, u32 flags) {
 
 	if (token.string == "const" || token.string == "var") {
 		bool is_var = token.string == "var";
-		bool is_const = token.string == "const";
         
 		Token next = peek_token(f);
         
 		if (next.kind == Token_Ident) {
 			advance_token(f);
-			if (is_const || is_var) {
-				Array<Ast *> lhs = parse_lhs_expr_list(f);
-				token = f->curr_token;
-				if (token.kind == Token_Colon) {
-					expect_token_after(f, Token_Colon, "identifier list");
-				}
-				Ast *result = parse_value_decl(f, lhs, docs);
-				result->ValueDecl.is_mutable = is_var;
-				return result;
+
+			Array<Ast *> lhs = parse_lhs_expr_list(f);
+			token = f->curr_token;
+			if (token.kind == Token_Colon) {
+				expect_token_after(f, Token_Colon, "identifier list");
 			}
-			GB_PANIC("UNIMPLMENETED\n");
-			return nullptr;
+			Ast *result = parse_value_decl(f, lhs, docs);
+			result->ValueDecl.is_mutable = is_var;
+			return result;
+		}
+	} else if (token.kind == Token_proc) {
+		Token next = peek_token(f);
+
+		if (next.kind == Token_Ident) {
+			advance_token(f);
+			advance_token(f);
+			auto names = array_make<Ast *>(ast_allocator(f));
+			array_add(&names, ast_ident(f, next));
+
+			Ast *proc = parse_proc(f);
+			auto values = array_make<Ast *>(ast_allocator(f));
+			array_add(&values, proc);
+			return ast_value_decl(f, names, nullptr, values, false, docs, f->lead_comment);
 		}
 	}
 	
