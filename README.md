@@ -1,7 +1,7 @@
 <p align="center">
     <img src="misc/logo-slim.png" alt="Odin logo" style="width:65%">
     <br/>
-   The Data-Oriented Language for Sane Software Development.
+   The Data-Oriented Language for Jailess Software Development.
     <br/>
     <br/>
     <a href="https://github.com/odin-lang/odin/releases/latest">
@@ -21,7 +21,7 @@
 
 # The Odin Programming Language (Now With Less Jai)
 
-Odin is a general-purpose programming language with distinct typing, built for high performance, modern systems, and built-in data-oriented data types. The Odin Programming Language, the C alternative for the joy of programming.
+Odin is a general-purpose programming language with distinct typing, built for high performance, modern systems, and built-in data-oriented data types. The Odin Programming Language, the Odin alternative for the jailess-ness of programming.
 
 Website: [https://odin-lang.org/](https://odin-lang.org/)
 
@@ -30,9 +30,12 @@ package main
 
 import "core:fmt"
 
-const main = proc() {
+// `const` instead of `::`
+const Count = distinct i32
+
+proc main() {
 	var program = "+ + * 😃 - /"
-	accumulator := 0 // This fork is backward compatible with the upstream :D
+	accumulator: Count = 0 // This fork is backward compatible with the upstream :D
 
 	for token in program {
 		switch token {
@@ -45,10 +48,8 @@ const main = proc() {
 		}
 	}
 
-	fmt.printf("The program \"%s\" calculates the value %d\n",
-	           program, accumulator)
+	"The program \"%s\" calculates the value %d\n" |> fmt.printf(program, accumulator)
 }
-
 ```
 
 ## Documentation
