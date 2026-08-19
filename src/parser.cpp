@@ -4229,6 +4229,29 @@ gb_internal Ast *parse_simple_stmt(AstFile *f, u32 flags) {
 	Token token = f->curr_token;
 	CommentGroup *docs = f->lead_comment;
 
+	if (token.string == "const" || token.string == "var") {
+		bool is_var = token.string == "var";
+		bool is_const = token.string == "const";
+        
+		Token next = peek_token(f);
+        
+		if (next.kind == Token_Ident) {
+			advance_token(f);
+			if (is_const || is_var) {
+				Array<Ast *> lhs = parse_lhs_expr_list(f);
+				token = f->curr_token;
+				if (token.kind == Token_Colon) {
+					expect_token_after(f, Token_Colon, "identifier list");
+				}
+				Ast *result = parse_value_decl(f, lhs, docs);
+				result->ValueDecl.is_mutable = is_var;
+				return result;
+			}
+			GB_PANIC("UNIMPLMENETED\n");
+			return nullptr;
+		}
+	}
+	
 	Array<Ast *> lhs = parse_lhs_expr_list(f);
 	token = f->curr_token;
 	switch (token.kind) {
