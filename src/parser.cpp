@@ -3926,17 +3926,19 @@ gb_internal i32 token_precedence(AstFile *f, TokenKind t) {
 			return 0;
 		}
 		return 2;
-	case Token_CmpOr:
+	case Token_Pipe:
 		return 3;
-	case Token_CmpAnd:
+	case Token_CmpOr:
 		return 4;
+	case Token_CmpAnd:
+		return 5;
 	case Token_CmpEq:
 	case Token_NotEq:
 	case Token_Lt:
 	case Token_Gt:
 	case Token_LtEq:
 	case Token_GtEq:
-		return 5;
+		return 6;
 
 	case Token_in:
 	case Token_not_in:
@@ -3948,7 +3950,7 @@ gb_internal i32 token_precedence(AstFile *f, TokenKind t) {
 	case Token_Sub:
 	case Token_Or:
 	case Token_Xor:
-		return 6;
+		return 7;
 	case Token_Mul:
 	case Token_Quo:
 	case Token_Mod:
@@ -3957,7 +3959,7 @@ gb_internal i32 token_precedence(AstFile *f, TokenKind t) {
 	case Token_AndNot:
 	case Token_Shl:
 	case Token_Shr:
-		return 7;
+		return 8;
 	}
 	return 0;
 }
@@ -4014,6 +4016,17 @@ gb_internal Ast *parse_binary_expr(AstFile *f, bool lhs, i32 prec_in) {
 			if (op.kind == Token_or_else) {
 				// NOTE(bill): easier to handle its logic different with its own AST kind
 				expr = ast_or_else_expr(f, expr, op, right);
+			} else if (op.kind == Token_Pipe) {
+				if (right->kind != Ast_CallExpr) {
+					syntax_error(right, "Rhs is not a function call. Maybe try putting parenthesis after!");
+					expr = ast_bad_expr(f, op, op);
+				} else {
+					auto args = array_make<Ast *>(ast_allocator(f));
+					array_add(&args, expr);
+					array_add_elems(&args, right->CallExpr.args.data, right->CallExpr.args.count);
+					right->CallExpr.args = slice_from_array(args);
+					expr = right;
+				}
 			} else {
 				expr = ast_binary_expr(f, op, expr, right);
 			}
