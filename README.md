@@ -48,7 +48,7 @@ proc main() {
 		}
 	}
 
-	"The program \"%s\" calculates the value %d\n" |> fmt.printf(program, accumulator)
+	"The program \"%s\" calculates the value %d\n" |> fmt.printf(accumulator)
 }
 ```
 
