@@ -564,6 +564,7 @@ gb_internal Ast *clone_ast(Ast *node, AstFile *f) {
 }
 
 
+gb_internal void error(Ast *node, char const *fmt, ...) ODIN_FMT_LIKE(2, 3);
 gb_internal void error(Ast *node, char const *fmt, ...) {
 	Token token = {};
 	TokenPos end_pos = {};
@@ -617,6 +618,7 @@ gb_internal void syntax_error_with_verbose(Ast *node, char const *fmt, ...) {
 }
 
 
+gb_internal void error_no_newline(Ast *node, char const *fmt, ...) ODIN_FMT_LIKE(2, 3);
 gb_internal void error_no_newline(Ast *node, char const *fmt, ...) {
 	Token token = {};
 	if (node != nullptr) {
@@ -632,6 +634,7 @@ gb_internal void error_no_newline(Ast *node, char const *fmt, ...) {
 	}
 }
 
+gb_internal void warning(Ast *node, char const *fmt, ...) ODIN_FMT_LIKE(2, 3);
 gb_internal void warning(Ast *node, char const *fmt, ...) {
 	Token token = {};
 	TokenPos end_pos = {};
@@ -645,6 +648,7 @@ gb_internal void warning(Ast *node, char const *fmt, ...) {
 	va_end(va);
 }
 
+gb_internal void syntax_error(Ast *node, char const *fmt, ...) ODIN_FMT_LIKE(2, 3);
 gb_internal void syntax_error(Ast *node, char const *fmt, ...) {
 	Token token = {};
 	TokenPos end_pos = {};
@@ -2485,6 +2489,16 @@ gb_internal Ast *parse_asm_operand(AstFile *f, bool allow_memory_operand) {
 	case Token_Float:
 	case Token_Rune:
 		return ast_basic_lit(f, advance_token(f));
+
+	case Token_Add:
+	case Token_Sub:
+	case Token_Xor:
+		{
+			Token token = advance_token(f);
+			Ast *op = parse_asm_operand(f, false);
+			return ast_unary_expr(f, token, op);
+		}
+
 	case Token_OpenParen:
 		return parse_expr(f, false);
 	case Token_OpenBracket:
@@ -2571,6 +2585,7 @@ gb_internal Slice<Ast *> parse_asm_operands(AstFile *f) {
 	operands.allocator = heap_allocator();
 
 	while (f->curr_token.kind != Token_Semicolon &&
+	       f->curr_token.kind != Token_CloseBrace &&
 	       f->curr_token.kind != Token_EOF) {
 		Ast *operand = parse_asm_operand(f, true);
 		if (operand != nullptr) {
@@ -2588,19 +2603,40 @@ gb_internal Slice<Ast *> parse_asm_operands(AstFile *f) {
 	return slice_from_array(operands);
 }
 
+
+gb_internal Ast *parse_asm_ident(AstFile *f, bool allow_poly_names=false) {
+	Token token = f->curr_token;
+	if (token.kind == Token_Ident) {
+		advance_token(f);
+	} else if (token_is_keyword(token.kind)) {
+		advance_token(f);
+	} else {
+		token.string = str_lit("_");
+		expect_token(f, Token_Ident);
+	}
+	return ast_ident(f, token);
+}
+
+
 gb_internal Ast *parse_asm_instruction(AstFile *f) {
 	if (allow_token(f, Token_Semicolon)) {
 		return nullptr;
 	}
+
+	if (token_is_keyword(f->curr_token.kind)) {
+		Ast *name = parse_asm_ident(f);
+		auto operands = parse_asm_operands(f);
+		Ast *instruction = alloc_ast_node(f, Ast_AsmInstruction);
+		instruction->AsmInstruction.name = name;
+		instruction->AsmInstruction.operands = operands;
+		instruction->AsmInstruction.valid_form_index = -1;
+		return instruction;
+	}
+
 	switch (f->curr_token.kind) {
-	default:
-		if (!token_is_keyword(f->curr_token.kind)) {
-			break;
-		}
-		/*fallthrough*/
 	case Token_Ident:
 		{
-			Ast *name = parse_ident(f);
+			Ast *name = parse_asm_ident(f);
 			auto operands = parse_asm_operands(f);
 			Ast *instruction = alloc_ast_node(f, Ast_AsmInstruction);
 			instruction->AsmInstruction.name = name;
@@ -2784,8 +2820,11 @@ gb_internal Ast *parse_asm_template(AstFile *f) {
 		asm_instructions = slice_from_array(instructions);
 	}
 
-	if (build_context.metrics.arch != TargetArch_amd64) {
-		syntax_error(token, "asm templates are currently only supported on -target:amd64");
+	if (build_context.metrics.arch == TargetArch_amd64 ||
+	    build_context.metrics.arch == TargetArch_riscv64) {
+	    	// okay
+	} else {
+		syntax_error(token, "asm templates are currently only supported on -target:*_amd64 or -target:*_riscv64");
 	}
 
 	Ast *asm_template = alloc_ast_node(f, Ast_AsmTemplate);
@@ -3630,7 +3669,10 @@ gb_internal Ast *parse_call_expr(AstFile *f, Ast *operand) {
 		} else if (seen_ellipsis) {
 			syntax_error(arg, "Positional arguments are not allowed after '..'");
 		}
-		array_add(&args, arg);
+		if (arg != nullptr) {
+			// `parse_atom_expr` returns nothing when `allow_type` is set and there is no operand
+			array_add(&args, arg);
+		}
 
 		if (ellipsis.pos.line != 0) {
 			seen_ellipsis = true;
