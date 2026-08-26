@@ -6058,6 +6058,9 @@ gb_internal Ast *parse_stmt(AstFile *f) {
 		} else if (tag == "include") {
 			syntax_error(token, "#include is not a valid import declaration kind. Did you mean 'import'?");
 			s = ast_bad_stmt(f, token, f->curr_token);
+		} else if (tag == "import") {
+			syntax_error(token, "Ay bro this is not JAI!");
+			s = ast_bad_stmt(f, token, f->curr_token);
 		} else if (tag == "define") {
 			s = ast_bad_stmt(f, token, f->curr_token);
 
