@@ -4329,7 +4329,23 @@ gb_internal Ast *parse_simple_stmt(AstFile *f, u32 flags) {
 			auto names = array_make<Ast *>(ast_allocator(f));
 			array_add(&names, ast_ident(f, next));
 
+			ProcInlining inlining = ProcInlining_none;
+			if (f->curr_token.kind == Token_Hash) {
+				expect_token(f, Token_Hash);
+				Token name = expect_token(f, Token_Ident);
+				String tag = name.string;
+				if (tag == "force_inline") {
+					inlining = ProcInlining_inline;
+				} else if (tag == "force_no_inline") {
+					inlining = ProcInlining_no_inline;
+				} else {
+					syntax_error(name, "This is not a valid directive here. only #force_inline and #force_no_inline are allowed.");
+					return ast_bad_stmt(f, token, name);
+				}
+			}
+
 			Ast *proc = parse_proc(f);
+			proc->ProcLit.inlining = inlining;
 			auto values = array_make<Ast *>(ast_allocator(f));
 			array_add(&values, proc);
 			return ast_value_decl(f, names, nullptr, values, false, docs, f->lead_comment);

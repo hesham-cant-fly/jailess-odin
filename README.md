@@ -94,6 +94,50 @@ Get live support and talk with other Odin programmers on the Odin Discord.
 
 The official blog of the Odin programming language, featuring announcements, news, and in-depth articles by the Odin team and guests.
 
+## Whats new in this fork?
+This fork only aims to change the syntax to something I think its better. its totally ok if you disagree with the syntax changes.
+Also this fork is backward compatible with the upstream odin. It still capable of compiling you regular Odin projects.
+
+### Constant declarations
+This fork introduces the `const` soft-keyword which replaces `::` in odin
+
+``` odin
+const FOO = 0
+const BAR: int = 67
+const BAZ :: 69
+const const: string : "const is a soft word :D"
+```
+
+### Variables
+I also replaced `:=` with `var`
+
+``` odin
+var x = 1
+var y: int = 2
+var z :: 3 // this still is a variable
+```
+
+### Functions
+Now functions are done with `proc ident()` syntax. and both of `#force_inline` and `#force_no_inline` directive are put right after the identifier.
+
+``` odin
+proc add(x, y: int) -> int {
+	return x + y
+}
+
+proc sub #force_inline(x, y: int) -> int {
+	return x + y
+}
+```
+
+### Pipes
+As an additional feature. Pipes are introduced in this fork. which works just as the same as in elixir or OCaml
+
+``` odin
+1 |> add(3)
+  |> sub(1) |> fmt.println()
+```
+
 ## Warnings
 
 * The Odin compiler is still in development.
