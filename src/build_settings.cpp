@@ -464,6 +464,15 @@ enum IntegerDivisionByZeroKind : u8 {
 	IntegerDivisionByZero_AllBits,
 };
 
+// values of BuildContext.optimization_level;
+// matches Odin_Optimization_Mode in checker.cpp
+enum OptimizationLevel : i32 {
+	OptimizationLevel_None       = -1,
+	OptimizationLevel_Minimal    =  0,
+	OptimizationLevel_Size       =  1,
+	OptimizationLevel_Speed      =  2,
+	OptimizationLevel_Aggressive =  3,
+};
 
 // This stores the information for the specify architecture of this build
 struct BuildContext {
@@ -509,6 +518,7 @@ struct BuildContext {
 	u64 vet_flags;
 	u32 sanitizer_flags;
 	StringSet vet_packages;
+	StringSet strict_style_packages;
 
 	bool   has_resource;
 	String link_flags;
@@ -2137,9 +2147,8 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 
 gb_internal bool check_single_target_feature_is_valid(String const &feature_list, String const &feature) {
 	String_Iterator it = {feature_list, 0};
-	for (;;) {
-		String str = string_split_iterator(&it, ',');
-		if (str == "") break;
+	String str = {};
+	while (string_split_iterator_next(&it, ',', &str)) {
 		if (str == feature) {
 			return true;
 		}
@@ -2151,8 +2160,8 @@ gb_internal bool check_single_target_feature_is_valid(String const &feature_list
 gb_internal bool check_target_feature_is_valid(String const &feature, TargetArchKind arch, String *invalid) {
 	String feature_list = target_features_list[arch];
 	String_Iterator it = {feature, 0};
-	for (;;) {
-		String str = string_split_iterator(&it, ',');
+	String str = {};
+	while (string_split_iterator_next(&it, ',', &str)) {
 		String feature_str = str;
 		if (string_starts_with(feature_str, '+') || string_starts_with(feature_str, '-')) {
 			feature_str = substring(feature_str, 1, feature_str.len);
@@ -2160,7 +2169,6 @@ gb_internal bool check_target_feature_is_valid(String const &feature, TargetArch
 				return false;
 			}
 		}
-		if (feature_str == "") break;
 		if (!check_single_target_feature_is_valid(feature_list, feature_str)) {
 			if (invalid) *invalid = str;
 			return false;
@@ -2172,10 +2180,8 @@ gb_internal bool check_target_feature_is_valid(String const &feature, TargetArch
 
 gb_internal bool check_target_feature_is_valid_globally(String const &feature, String *invalid) {
 	String_Iterator it = {feature, 0};
-	for (;;) {
-		String str = string_split_iterator(&it, ',');
-		if (str == "") break;
-
+	String str = {};
+	while (string_split_iterator_next(&it, ',', &str)) {
 		bool valid = false;
 		for (int arch = TargetArch_Invalid; arch < TargetArch_COUNT; arch += 1) {
 			if (check_target_feature_is_valid(str, cast(TargetArchKind)arch, invalid)) {
@@ -2199,15 +2205,19 @@ gb_internal bool check_target_feature_is_valid_for_target_arch(String const &fea
 
 gb_internal bool check_target_feature_is_enabled(String const &feature, String *not_enabled) {
 	String_Iterator it = {feature, 0};
-	for (;;) {
-		String str = string_split_iterator(&it, ',');
+	String str = {};
+	while (string_split_iterator_next(&it, ',', &str)) {
 		String feature_str = str;
 		bool want_enabled = true;
 		if (string_starts_with(feature_str, '+') || string_starts_with(feature_str, '-')) {
 			want_enabled = feature_str[0] == '+';
 			feature_str = substring(feature_str, 1, feature_str.len);
 		}
-		if (feature_str == "") break;
+		if (feature_str == "") {
+			// a bare sign names no feature, which cannot be enabled
+			if (not_enabled) *not_enabled = str;
+			return false;
+		}
 
 		String plus_str  = concatenate_strings(temporary_allocator(), make_string_c("+"), feature_str);
 		String minus_str = concatenate_strings(temporary_allocator(), make_string_c("-"), feature_str);
@@ -2231,9 +2241,8 @@ gb_internal bool check_target_feature_is_enabled(String const &feature, String *
 
 gb_internal bool check_target_feature_is_superset_of(String const &superset, String const &of, String *missing) {
 	String_Iterator it = {of, 0};
-	for (;;) {
-		String str = string_split_iterator(&it, ',');
-		if (str == "") break;
+	String str = {};
+	while (string_split_iterator_next(&it, ',', &str)) {
 		if (!check_single_target_feature_is_valid(superset, str)) {
 			if (missing) *missing = str;
 			return false;
@@ -2283,14 +2292,18 @@ gb_internal bool init_build_paths(String init_filename) {
 
 	string_set_init(&bc->target_features_set, 1024);
 
-	// [BuildPathMainPackage] Turn given init path into a `Path`, which includes normalizing it into a full path.
+	// Turn given init path into a `Path`, which includes normalizing it into a full path.
 	bc->build_paths[BuildPath_Main_Package] = path_from_string(ha, init_filename);
 
-	{
-		String build_project_name  = last_path_element(bc->build_paths[BuildPath_Main_Package].basename);
-		GB_ASSERT(build_project_name.len > 0);
-		bc->ODIN_BUILD_PROJECT_NAME = build_project_name;
+	Path   main_pkg           = bc->build_paths[BuildPath_Main_Package];
+	String build_project_name = last_path_element(bc->build_paths[BuildPath_Main_Package].basename);
+
+	if (build_project_name.len == 0) {
+		// Happens when building a package at root.
+		build_project_name = str_lit("/");
 	}
+
+	bc->ODIN_BUILD_PROJECT_NAME = build_project_name;
 
 	bool produces_output_file = false;
 	if (bc->command_kind == Command_doc && bc->cmd_doc_flags & CmdDocFlag_DocFormat) {
@@ -2448,13 +2461,14 @@ gb_internal bool init_build_paths(String init_filename) {
 	} else {
 		Path output_path;
 
-		if (str_eq(init_filename, str_lit("."))) {
+		if (str_eq(init_filename, str_lit(".")) || str_eq(init_filename, str_lit("/"))) {
 			// We must name the output file after the current directory.
 			debugf("Output name will be created from current base name %.*s.\n", LIT(bc->build_paths[BuildPath_Main_Package].basename));
 			String last_element  = last_path_element(bc->build_paths[BuildPath_Main_Package].basename);
 
 			if (last_element.len == 0) {
-				gb_printf_err("The output name is created from the last path element. `%.*s` has none. Use `-out:output_name.ext` to set it.\n", LIT(bc->build_paths[BuildPath_Main_Package].basename));
+				String init_fullpath = path_to_full_path(ha, init_filename);
+				gb_printf_err("The output name is created from the last path element. `%.*s` has none. Use `-out:output_name.ext` to set it.\n", LIT(init_fullpath));
 				return false;
 			}
 			output_path.basename = copy_string(ha, bc->build_paths[BuildPath_Main_Package].basename);
@@ -2630,12 +2644,13 @@ gb_internal bool init_build_paths(String init_filename) {
 
 	if (build_context.no_crt && !build_context.no_thread_local) {
 		switch (build_context.metrics.os) {
+		case TargetOs_windows:
 		case TargetOs_linux:
 		case TargetOs_darwin:
 		case TargetOs_freebsd:
 		case TargetOs_openbsd:
 		case TargetOs_netbsd:
-			gb_printf_err("-no-crt on Unix systems requires the -no-thread-local flag to also be present, because the TLS is inaccessible without CRT\n");
+			gb_printf_err("-no-crt requires the -no-thread-local flag to also be present, because the TLS is inaccessible without CRT\n");
 			no_crt_checks_failed = true;
 		}
 	}

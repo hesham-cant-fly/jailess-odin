@@ -366,6 +366,9 @@ gb_internal void check_scope_decls(CheckerContext *c, Slice<Ast *> const &nodes,
 
 	check_collect_entities(c, nodes);
 
+	// NOTE: checking a declaration can insert entities into this very scope - a procedure alias
+	// goes through `override_entity_in_scope`, which inserts into the scope being iterated - so
+	// the iteration must not be invalidated by `s->elements` growing; see ScopeMapIterator.
 	for (auto const &entry : s->elements) {
 		Entity *e = entry.value;\
 		switch (e->kind) {
@@ -948,7 +951,12 @@ gb_internal i64 check_distance_between_types(CheckerContext *c, Operand *operand
 		if (check_polymorphic_procedure_assignment(c, operand, type, operand->expr, &poly_proc_data)) {
 			Entity *e = poly_proc_data.gen_entity;
 			add_type_and_value(c, operand->expr, Addressing_Value, e->type, {});
-			add_entity_use(c, operand->expr, e);
+			Ast *expr = unparen_expr(operand->expr);
+			if (expr->kind == Ast_SelectorExpr) {
+				add_entity_use(c, expr->SelectorExpr.selector, e);
+			} else {
+				add_entity_use(c, operand->expr, e);
+			}
 			return 4;
 		}
 
@@ -2097,6 +2105,12 @@ gb_internal Entity *check_ident(CheckerContext *c, Operand *o, Ast *n, Type *nam
 		break;
 
 	case Entity_AsmTemplate:
+		if (c->asm_template_hint != n) {
+			error(n, "'asm' templates must either be defined as a declaration or within a procedure call directly");
+			o->mode = Addressing_Invalid;
+			o->type = t_invalid;
+			return e;
+		}
 		o->mode = Addressing_Value;
 		break;
 
@@ -5594,7 +5608,7 @@ gb_internal ExactValue get_constant_field_single(CheckerContext *c, ExactValue v
 				if (success_) *success_ = false;
 				if (finish_) *finish_ = true;
 				return empty_exact_value;
-			} else if (is_type_struct(node->tav.type)) {
+			} else if (is_type_struct(node->tav.type) || is_type_bit_field(node->tav.type)) {
 				bool found = false;
 				for (Ast *elem : cl->elems) {
 					if (elem->kind != Ast_FieldValue) {
@@ -5924,7 +5938,10 @@ gb_internal Entity *check_entity_from_ident_or_selector(CheckerContext *c, Ast *
 				if (entity->kind == Entity_ProcGroup) {
 					return entity;
 				}
-				GB_ASSERT_MSG(entity->type != nullptr, "%.*s (%.*s)", LIT(entity->token.string), LIT(entity_strings[entity->kind]));
+				// GB_ASSERT_MSG(entity->type != nullptr, "%.*s (%.*s)", LIT(entity->token.string), LIT(entity_strings[entity->kind]));
+				if (entity->type == nullptr) {
+					return nullptr;
+				}
 			}
 		}
 
@@ -6055,7 +6072,10 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 				add_type_and_value(c, operand->expr, operand->mode, operand->type, operand->value);
 				return entity;
 			}
-			GB_ASSERT_MSG(entity->type != nullptr, "%.*s (%.*s)", LIT(entity->token.string), LIT(entity_strings[entity->kind]));
+			// GB_ASSERT_MSG(entity->type != nullptr, "%.*s (%.*s)", LIT(entity->token.string), LIT(entity_strings[entity->kind]));
+			if (entity->type == nullptr) {
+				return nullptr;
+			}
 		}
 	}
 
@@ -6373,6 +6393,12 @@ gb_internal Entity *check_selector(CheckerContext *c, Operand *operand, Ast *nod
 		break;
 
 	case Entity_AsmTemplate:
+		if (c->asm_template_hint != node) {
+			error(node, "'asm' templates must either be defined as a declaration or within a procedure call directly");
+			operand->mode = Addressing_Invalid;
+			operand->type = t_invalid;
+			return entity;
+		}
 		operand->mode = Addressing_Value;
 		break;
 	}
@@ -6991,6 +7017,18 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 			if (o->mode != Addressing_Constant) {
 				if (show_error) {
 					error(o->expr, "Expected a constant value for the argument '%.*s'", LIT(e->token.string));
+				}
+				err = CallArgumentError_NoneConstantParameter;
+			}
+		}
+
+		// an `asm` template's `$` parameter is encoded as an immediate, so only a constant can reach it
+		if (e && e->kind == Entity_Variable && (e->flags & EntityFlag_PolyConst)) {
+			if (o->mode != Addressing_Constant) {
+				if (show_error) {
+					gbString str = expr_to_string(o->expr);
+					error(o->expr, "Expected a constant value for the '$' immediate '%.*s', got %s", LIT(e->token.string), str);
+					gb_string_free(str);
 				}
 				err = CallArgumentError_NoneConstantParameter;
 			}
@@ -8931,7 +8969,11 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 				operand->expr  = proc;
 				add_type_and_value(c, proc, operand->mode, operand->type, operand->value);
 			} else {
+				// the callee is the one position where an asm template is allowed to produce a value
+				Ast *prev_hint = c->asm_template_hint;
+				c->asm_template_hint = unnested_proc;
 				check_expr_or_type(c, operand, proc);
+				c->asm_template_hint = prev_hint;
 			}
 		} else {
 			GB_ASSERT(operand->expr != nullptr);
@@ -9122,25 +9164,29 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 		break;
 	}
 
-	{
+	if (pt->kind == Type_Proc) {
+		char const *kind = "procedure";
+		if (pt->Proc.calling_convention == ProcCC_InlineAsm) {
+			kind = "inline 'asm' template";
+		}
 		String invalid;
-		if (pt->kind == Type_Proc && pt->Proc.require_target_feature.len != 0) {
+		if (pt->Proc.require_target_feature.len != 0) {
 			if (!check_target_feature_is_valid_for_target_arch(pt->Proc.require_target_feature, &invalid)) {
-				error(call, "Called procedure requires target feature '%.*s' which is invalid for the build target", LIT(invalid));
+				error(call, "Called %s requires target feature '%.*s' which is invalid for the build target", kind, LIT(invalid));
 			} else if (!check_target_feature_is_enabled(pt->Proc.require_target_feature, &invalid)) {
-				error(call, "Calling this procedure requires target feature '%.*s' to be enabled", LIT(invalid));
+				error(call, "Calling this %s requires target feature '%.*s' to be enabled", kind, LIT(invalid));
 			}
 		}
 
-		if (pt->kind == Type_Proc && pt->Proc.enable_target_feature.len != 0) {
+		if (pt->Proc.enable_target_feature.len != 0) {
 			if (!check_target_feature_is_valid_for_target_arch(pt->Proc.enable_target_feature, &invalid)) {
-				error(call, "Called procedure enables target feature '%.*s' which is invalid for the build target", LIT(invalid));
+				error(call, "Called %s enables target feature '%.*s' which is invalid for the build target", kind, LIT(invalid));
 			}
 
 			// NOTE: Due to restrictions in LLVM you can not inline calls with a superset of features.
 			if (is_call_inlined) {
 				if (c->curr_proc_decl == nullptr) {
-					error(call, "Calling a '#force_inline' procedure that enables target features is not allowed at file scope");
+					error(call, "Calling a '#force_inline' %s that enables target features is not allowed at file scope", kind);
 				} else {
 					Entity *e = c->curr_proc_decl->entity.load();
 					GB_ASSERT(e);
@@ -9148,7 +9194,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 					String scope_features = e->type->Proc.enable_target_feature;
 					if (!check_target_feature_is_superset_of(scope_features, pt->Proc.enable_target_feature, &invalid)) {
 						ERROR_BLOCK();
-						error(call, "Inlined procedure enables target feature '%.*s', this requires the calling procedure to at least enable the same feature", LIT(invalid));
+						error(call, "Inlined %s enables target feature '%.*s', this requires the calling %s to at least enable the same feature", kind, LIT(invalid), kind);
 
 						error_line("\tSuggested Example: @(enable_target_feature=\"%.*s\")\n", LIT(invalid));
 					}
@@ -12171,9 +12217,9 @@ gb_internal ExprKind check_index_expr(CheckerContext *c, Operand *o, Ast *node, 
 		if (index < 0) {
 			ERROR_BLOCK();
 			gbString str = expr_to_string(o->expr);
-			error(o->expr, "Cannot index a constant '%s'", str);
+			error(o->expr, "Cannot index a constant '%s' with a variable index", str);
 			if (!build_context.terse_errors) {
-				error_line("\tSuggestion: store the constant into a variable in order to index it with a variable index\n");
+				error_line("\tSuggestion: store the constant into a variable or index it with a constant index\n");
 			}
 			gb_string_free(str);
 			o->mode = Addressing_Invalid;
@@ -13878,6 +13924,10 @@ gb_internal gbString write_expr_to_string(gbString str, Ast *node, bool shorthan
 			str = gb_string_appendc(str, " = ");
 			str = write_expr_to_string(str, spec->value, shorthand);
 		}
+		for (Ast *dir : spec->directives) {
+			str = gb_string_appendc(str, " ");
+			str = write_expr_to_string(str, dir, shorthand);
+		}
 	case_end;
 
 	case_ast_node(clobber, AsmClobber, node);
@@ -13907,22 +13957,36 @@ gb_internal gbString write_expr_to_string(gbString str, Ast *node, bool shorthan
 		}
 	case_end;
 
+	case_ast_node(term, AsmMemoryTerm, node);
+		GB_ASSERT(term->operand != nullptr);
+		str = write_expr_to_string(str, term->operand, shorthand);
+		if (term->scale != nullptr) {
+			str = gb_string_append_length(str, term->scale_op.string.text, term->scale_op.string.len);
+			str = write_expr_to_string(str, term->scale, shorthand);
+		}
+	case_end;
 	case_ast_node(op, AsmMemoryOperand, node);
 		str = gb_string_appendc(str, "[");
-		str = write_expr_to_string(str, op->base, shorthand);
-		if (op->index) {
-			str = gb_string_appendc(str, " + ");
-			str = write_expr_to_string(str, op->index, shorthand);
-			if (op->scale) {
-				str = gb_string_appendc(str, "*");
-				str = write_expr_to_string(str, op->scale, shorthand);
-			}
+		if (op->segment_override != nullptr) {
+			str = write_expr_to_string(str, op->segment_override, shorthand);
+			str = gb_string_appendc(str, ":");
 		}
-		if (op->disp) {
-			str = gb_string_appendc(str, " + ");
-			str = write_expr_to_string(str, op->disp, shorthand);
+		for_array(i, op->terms) {
+			Ast *term = op->terms[i];
+			GB_ASSERT(term->kind == Ast_AsmMemoryTerm);
+			Token tok = term->AsmMemoryTerm.op;
+			if (i > 0 || tok.kind != Token_Add) {
+				str = gb_string_appendc(str, " ");
+				str = gb_string_append_length(str, tok.string.text, tok.string.len);
+				str = gb_string_appendc(str, " ");
+			}
+			str = write_expr_to_string(str, term, shorthand);
 		}
 		str = gb_string_appendc(str, "]");
+		if (op->type != nullptr) {
+			str = gb_string_appendc(str, ":");
+			str = write_expr_to_string(str, op->type, shorthand);
+		}
 	case_end;
 	}
 

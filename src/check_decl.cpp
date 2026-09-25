@@ -83,11 +83,7 @@ gb_internal Type *check_init_variable(CheckerContext *ctx, Entity *e, Operand *o
 			}
 			t = default_type(t);
 		}
-		if (is_type_asm_proc(t)) {
-			error(e->token, "Invalid use of inline asm in %.*s", LIT(context_name));
-			e->type = t_invalid;
-			return nullptr;
-		} else if (is_type_polymorphic(t)) {
+		if (is_type_polymorphic(t)) {
 			Entity *e2 = entity_of_node(operand->expr);
 			if (e2 == nullptr) {
 				e->type = t_invalid;
@@ -1223,6 +1219,41 @@ gb_internal void check_objc_methods(CheckerContext *ctx, Entity *e, AttributeCon
 	}
 }
 
+gb_internal void check_target_feature_attributes(AttributeContext &ac, Entity *entity, Type *type) {
+	GB_ASSERT(type->kind == Type_Proc);
+	TypeProc *pt = &type->Proc;
+	if (ac.require_target_feature.len != 0 && ac.enable_target_feature.len != 0) {
+		error(entity->token, "A procedure cannot have both @(require_target_feature=\"...\") and @(enable_target_feature=\"...\")");
+	}
+
+	if (build_context.strict_target_features && ac.enable_target_feature.len != 0) {
+		ac.require_target_feature = ac.enable_target_feature;
+		ac.enable_target_feature.len = 0;
+	}
+
+	if (ac.require_target_feature.len != 0) {
+		pt->require_target_feature = ac.require_target_feature;
+		String invalid;
+		if (!check_target_feature_is_valid_globally(ac.require_target_feature, &invalid)) {
+			error(entity->token, "Required target feature '%.*s' is not a valid target feature", LIT(invalid));
+		} else if (!check_target_feature_is_enabled(ac.require_target_feature, nullptr)) {
+			entity->flags |= EntityFlag_Disabled;
+		}
+	} else if (ac.enable_target_feature.len != 0) {
+
+		// NOTE: disallow wasm, features on that arch are always global to the module.
+		if (is_arch_wasm()) {
+			error(entity->token, "@(enable_target_feature=\"...\") is not allowed on wasm, features for wasm must be declared globally");
+		}
+
+		pt->enable_target_feature = ac.enable_target_feature;
+		String invalid;
+		if (!check_target_feature_is_valid_globally(ac.enable_target_feature, &invalid)) {
+			error(entity->token, "Procedure enabled target feature '%.*s' is not a valid target feature", LIT(invalid));
+		}
+	}
+}
+
 gb_internal void check_foreign_procedure(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 	GB_ASSERT(e != nullptr);
 	GB_ASSERT(e->kind == Entity_Procedure);
@@ -1349,38 +1380,7 @@ gb_internal void check_proc_decl(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 
 	check_objc_methods(ctx, e, ac);
 
-	{
-		if (ac.require_target_feature.len != 0 && ac.enable_target_feature.len != 0) {
-			error(e->token, "A procedure cannot have both @(require_target_feature=\"...\") and @(enable_target_feature=\"...\")");
-		}
-
-		if (build_context.strict_target_features && ac.enable_target_feature.len != 0) {
-			ac.require_target_feature = ac.enable_target_feature;
-			ac.enable_target_feature.len = 0;
-		}
-
-		if (ac.require_target_feature.len != 0) {
-			pt->require_target_feature = ac.require_target_feature;
-			String invalid;
-			if (!check_target_feature_is_valid_globally(ac.require_target_feature, &invalid)) {
-				error(e->token, "Required target feature '%.*s' is not a valid target feature", LIT(invalid));
-			} else if (!check_target_feature_is_enabled(ac.require_target_feature, nullptr)) {
-				e->flags |= EntityFlag_Disabled;
-			}
-		} else if (ac.enable_target_feature.len != 0) {
-
-			// NOTE: disallow wasm, features on that arch are always global to the module.
-			if (is_arch_wasm()) {
-				error(e->token, "@(enable_target_feature=\"...\") is not allowed on wasm, features for wasm must be declared globally");
-			}
-
-			pt->enable_target_feature = ac.enable_target_feature;
-			String invalid;
-			if (!check_target_feature_is_valid_globally(ac.enable_target_feature, &invalid)) {
-				error(e->token, "Procedure enabled target feature '%.*s' is not a valid target feature", LIT(invalid));
-			}
-		}
-	}
+	check_target_feature_attributes(ac, e, proc_type);
 
 	switch (e->Procedure.optimization_mode) {
 	case ProcedureOptimizationMode_None:
@@ -1560,7 +1560,11 @@ gb_internal void check_proc_decl(CheckerContext *ctx, Entity *e, DeclInfo *d) {
 
 			if (e->pkg->kind == Package_Init) {
 				if (ctx->info->entry_point != nullptr) {
-					error(e->token, "Redeclaration of the entry pointer procedure 'main'");
+					begin_error_block();
+					error(e->token, "Redeclaration of the entry point procedure 'main'");
+					error_line("\tSuggestion: Is this a single-file package? If so, try compiling using the `-file` flag.\n");
+					end_error_block();
+
 				} else {
 					ctx->info->entry_point = e;
 				}
@@ -1778,7 +1782,8 @@ gb_internal void check_global_variable_decl(CheckerContext *ctx, Entity *e, Ast 
 			TokenPos pos = f->token.pos;
 			Type *this_type = base_type(e->type);
 			Type *other_type = base_type(f->type);
-			if (!signature_parameter_similar_enough(this_type, other_type)) {
+			bool type_is_null = (e->type == nullptr || f->type == nullptr);
+			if (type_is_null || !signature_parameter_similar_enough(this_type, other_type)) {
 				error(e->token,
 				      "Foreign entity '%.*s' previously declared elsewhere with a different type\n"
 				      "\tat %s",
@@ -2024,11 +2029,14 @@ gb_internal void check_asm_group_decl(CheckerContext *ctx, Entity *asm_entity, D
 			arg = arg->BinaryExpr.left;
 		}
 
+		Ast *prev_hint = ctx->asm_template_hint;
+		ctx->asm_template_hint = arg;
 		if (arg->kind == Ast_Ident) {
 			e = check_ident(ctx, &o, arg, nullptr, nullptr, true);
 		} else if (arg->kind == Ast_SelectorExpr) {
 			e = check_selector(ctx, &o, arg, nullptr);
 		}
+		ctx->asm_template_hint = prev_hint;
 		if (e == nullptr) {
 			error(arg, "Expected a valid entity name in asm template group, got %.*s", LIT(ast_strings[arg->kind]));
 			continue;

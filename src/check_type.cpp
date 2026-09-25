@@ -349,6 +349,12 @@ gb_internal void add_polymorphic_record_entity(CheckerContext *ctx, Ast *node, T
 	// TODO(bill): Is this even correct? Or should the metadata be copied?
 	e->TypeName.objc_metadata = original_type->Named.type_name->TypeName.objc_metadata;
 
+	// NOTE: Do not add polymorphic specializations to gen_types.
+	// Adding one here would just grow gen_types by one per check and make the linear lookups quadratic overall.
+	if (is_type_polymorphic(named_type)) {
+		return;
+	}
+
 	auto *found_gen_types = ensure_polymorphic_record_entity_has_gen_types(ctx, original_type);
 	mutex_lock(&found_gen_types->mutex);
 	defer (mutex_unlock(&found_gen_types->mutex));
@@ -887,7 +893,8 @@ gb_internal void check_enum_type(CheckerContext *ctx, Type *enum_type, Type *nam
 	enum_type->Enum.scope = ctx->scope;
 
 	Type *base_type = t_int;
-	if (unparen_expr(et->base_type) != nullptr) {
+	bool base_type_implicit = (unparen_expr(et->base_type) == nullptr);
+	if (!base_type_implicit) {
 		base_type = check_type(ctx, et->base_type);
 	}
 
@@ -967,6 +974,27 @@ gb_internal void check_enum_type(CheckerContext *ctx, Type *enum_type, Type *nam
 		} else {
 			iota = exact_binary_operator_value(Token_Add, iota, exact_value_i64(1));
 			entity_flags |= EntityConstantFlag_ImplicitEnumValue;
+
+			if (!base_type_implicit) {
+				int bits_iota = mp_count_bits(&iota.value_integer);
+				int bits_type = (int)type_size_of(base_type) * 8;
+				if (bits_iota > bits_type) {
+					ERROR_BLOCK();
+
+					gbString a = expr_to_string(ident);
+					gbString b = exact_value_to_string(iota);
+					gbString c = type_to_string(base_type);
+					gbString d = type_to_string(constant_type);
+					defer(
+						gb_string_free(a);
+						gb_string_free(b);
+						gb_string_free(c);
+						gb_string_free(d);
+					);
+
+					error(ident, "'%s' gets value '%s' which overflows base type '%s' of enumeration '%s'", a, b, c, d);
+				}
+			}
 		}
 
 
@@ -1118,6 +1146,13 @@ gb_internal void check_bit_field_type(CheckerContext *ctx, Type *bit_field_type,
 			gbString s = expr_to_string(f->bit_size);
 			error(f->bit_size, "Wrap the expression in parentheses, e.g. (%s)", s);
 			gb_string_free(s);
+		}
+
+		if (o.mode == Addressing_Constant) {
+			convert_to_typed(ctx, &o, t_int);
+			if (o.mode == Addressing_Invalid) {
+				o.value = exact_value_i64(1);
+			}
 		}
 
 		ExactValue bit_size = o.value;
